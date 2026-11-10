@@ -1,0 +1,33 @@
+name: CI & Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build (Windows MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release
+        run: cargo build --release
+
+      - name: Upload Release Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: perimon-windows-x86_64
+          path: target/release/perimon.exe
