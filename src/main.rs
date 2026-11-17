@@ -266,6 +266,34 @@ fn deduplicate_bluetooth_devices(devices: &[BluetoothDeviceStatus]) -> Vec<Bluet
     list
 }
 
+fn infer_device_kind(name: &str) -> DeviceKind {
+    let lower = name.to_lowercase();
+    if lower.contains("head")
+        || lower.contains("moondrop")
+        || lower.contains("ath")
+        || lower.contains("ear")
+        || lower.contains("pods")
+        || lower.contains("buds")
+        || lower.contains("blackshark")
+        || lower.contains("cloud")
+    {
+        DeviceKind::Headset
+    } else if lower.contains("mouse")
+        || lower.contains("master")
+        || lower.contains("viper")
+        || lower.contains("deathadder")
+        || lower.contains("superlight")
+        || lower.contains("g pro")
+        || lower.contains("basilisk")
+    {
+        DeviceKind::Mouse
+    } else if lower.contains("key") || lower.contains("board") {
+        DeviceKind::Keyboard
+    } else {
+        DeviceKind::Bluetooth
+    }
+}
+
 fn build_device_rows(status: &AllDevicesStatus) -> Vec<DeviceRowModel> {
     let mut rows = Vec::new();
 
@@ -365,24 +393,27 @@ fn build_device_rows(status: &AllDevicesStatus) -> Vec<DeviceRowModel> {
         connected: is_kc_active,
     });
 
-    // 4. Bluetooth Devices
+    // 4. Extra 2.4GHz HID Wireless Devices (Logitech LIGHTSPEED / Razer HyperSpeed)
+    for dev in &status.extra_hid_devices {
+        rows.push(DeviceRowModel {
+            kind: infer_device_kind(&dev.device),
+            name: dev.device.clone(),
+            subtitle: dev.connection_type.clone(),
+            battery: dev.battery,
+            charging: dev.charging,
+            status_badge: if dev.connected {
+                None
+            } else {
+                Some("Offline".to_string())
+            },
+            tooltip: None,
+            connected: dev.connected,
+        });
+    }
+
+    // 5. Bluetooth Devices
     for dev in deduplicate_bluetooth_devices(&status.other_devices) {
-        let lower = dev.device.to_lowercase();
-        let kind = if lower.contains("head")
-            || lower.contains("moondrop")
-            || lower.contains("ath")
-            || lower.contains("ear")
-            || lower.contains("pods")
-            || lower.contains("buds")
-        {
-            DeviceKind::Headset
-        } else if lower.contains("mouse") || lower.contains("master") {
-            DeviceKind::Mouse
-        } else if lower.contains("key") || lower.contains("board") {
-            DeviceKind::Keyboard
-        } else {
-            DeviceKind::Bluetooth
-        };
+        let kind = infer_device_kind(&dev.device);
 
         let sub = if dev.connected {
             "Bluetooth".to_string()
@@ -853,6 +884,20 @@ impl eframe::App for BatteryApp {
                         }
                     } else if bat > 30 || status.incott.charging {
                         self.notified_low_devices.remove(name);
+                    }
+                }
+            }
+
+            for dev in &status.extra_hid_devices {
+                if dev.connected {
+                    if let Some(bat) = dev.battery {
+                        if bat <= 20 && bat > 0 && !dev.charging {
+                            if self.notified_low_devices.insert(dev.device.clone()) {
+                                notify_low_battery(&dev.device, bat);
+                            }
+                        } else if bat > 30 || dev.charging {
+                            self.notified_low_devices.remove(&dev.device);
+                        }
                     }
                 }
             }

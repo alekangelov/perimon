@@ -135,6 +135,7 @@ unsafe extern "system" {
     pub fn HidD_SetOutputReport(handle: HANDLE, report: *const u8, len: ULONG) -> BOOL;
     pub fn HidD_SetFeature(handle: HANDLE, report: *const u8, len: ULONG) -> BOOL;
     pub fn HidD_GetFeature(handle: HANDLE, report: *mut u8, len: ULONG) -> BOOL;
+    pub fn HidD_GetProductString(handle: HANDLE, buffer: *mut u16, buffer_len: ULONG) -> BOOL;
 }
 
 #[link(name = "setupapi")]

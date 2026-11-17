@@ -51,11 +51,21 @@ pub struct BluetoothDeviceStatus {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HidWirelessDeviceStatus {
+    pub device: String,
+    pub connected: bool,
+    pub battery: Option<u8>,
+    pub charging: bool,
+    pub connection_type: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AllDevicesStatus {
     pub timestamp: f64,
     pub hyperx: HyperXStatus,
     pub incott: IncottStatus,
     pub keychron: KeychronStatus,
+    pub extra_hid_devices: Vec<HidWirelessDeviceStatus>,
     pub other_devices: Vec<BluetoothDeviceStatus>,
 }
 
@@ -69,6 +79,7 @@ pub struct HidInterfaceInfo {
     pub in_len: u16,
     pub out_len: u16,
     pub feat_len: u16,
+    pub product_name: String,
     pub path: String,
 }
 
@@ -169,6 +180,14 @@ pub fn enumerate_hid_interfaces() -> Vec<HidInterfaceInfo> {
                             HidP_GetCaps(preparsed, &mut caps);
                             HidD_FreePreparsedData(preparsed);
 
+                            let mut prod_buf = [0u16; 128];
+                            let product_name = if HidD_GetProductString(h, prod_buf.as_mut_ptr(), 256) != 0 {
+                                let len = prod_buf.iter().position(|&c| c == 0).unwrap_or(prod_buf.len());
+                                String::from_utf16_lossy(&prod_buf[..len]).trim().to_string()
+                            } else {
+                                String::new()
+                            };
+
                             results.push(HidInterfaceInfo {
                                 vid: attr.vendor_id,
                                 pid: attr.product_id,
@@ -177,6 +196,7 @@ pub fn enumerate_hid_interfaces() -> Vec<HidInterfaceInfo> {
                                 in_len: caps.input_report_byte_length,
                                 out_len: caps.output_report_byte_length,
                                 feat_len: caps.feature_report_byte_length,
+                                product_name,
                                 path,
                             });
                         }
@@ -623,6 +643,260 @@ pub fn read_keychron_and_bluetooth() -> (KeychronStatus, Vec<BluetoothDeviceStat
     (final_keychron, all_bt)
 }
 
+// -----------------------------------------------------------------------------
+// Logitech HID++ 2.0 (VID 0x046D, UsagePage 0xFF00, Long Report 0x11 = 20 bytes)
+// Supports Unified Battery (0x1004) and Battery Level Status (0x1000)
+// -----------------------------------------------------------------------------
+
+unsafe fn hidpp_transact(
+    h: *mut c_void,
+    dev_idx: u8,
+    feat_idx: u8,
+    func_sw: u8,
+    params: &[u8],
+) -> Option<[u8; 20]> {
+    unsafe {
+        let mut out = [0u8; 20];
+        out[0] = 0x11;
+        out[1] = dev_idx;
+        out[2] = feat_idx;
+        out[3] = func_sw;
+        for (i, &b) in params.iter().take(16).enumerate() {
+            out[4 + i] = b;
+        }
+
+        let mut ov_r = OVERLAPPED {
+            h_event: CreateEventW(ptr::null_mut(), 1, 0, ptr::null()),
+            ..Default::default()
+        };
+        let mut in_buf = [0u8; 20];
+        let mut rb: DWORD = 0;
+        ReadFile(h, in_buf.as_mut_ptr(), 20, &mut rb, &mut ov_r);
+
+        let mut ov_w = OVERLAPPED {
+            h_event: CreateEventW(ptr::null_mut(), 1, 0, ptr::null()),
+            ..Default::default()
+        };
+        let mut wb: DWORD = 0;
+        WriteFile(h, out.as_ptr(), 20, &mut wb, &mut ov_w);
+        WaitForSingleObject(ov_w.h_event, 100);
+        CloseHandle(ov_w.h_event);
+
+        let mut result = None;
+        for _ in 0..3 {
+            if WaitForSingleObject(ov_r.h_event, 120) == WAIT_OBJECT_0 {
+                GetOverlappedResult(h, &mut ov_r, &mut rb, 0);
+                if rb >= 7 && in_buf[0] == 0x11 && in_buf[1] == dev_idx && in_buf[2] == feat_idx {
+                    result = Some(in_buf);
+                    break;
+                }
+                // Re-arm read if we caught an unrelated notification
+                in_buf = [0u8; 20];
+                ReadFile(h, in_buf.as_mut_ptr(), 20, &mut rb, &mut ov_r);
+            } else {
+                CancelIo(h);
+                break;
+            }
+        }
+        CloseHandle(ov_r.h_event);
+        result
+    }
+}
+
+pub fn read_logitech_hidpp_devices(devices: &[HidInterfaceInfo]) -> Vec<HidWirelessDeviceStatus> {
+    let mut found = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+
+    for d in devices.iter().filter(|d| {
+        d.vid == 0x046D && d.usage_page == 0xFF00 && d.in_len == 20 && d.out_len == 20
+    }) {
+        if !seen_paths.insert(d.path.clone()) {
+            continue;
+        }
+        unsafe {
+            let wide_path = to_wide_null(&d.path);
+            let h = CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            );
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+
+            let base_name = if d.product_name.is_empty() {
+                format!("Logitech Wireless ({:04X})", d.pid)
+            } else {
+                d.product_name.clone()
+            };
+
+            // Probe direct (0xFF) and paired receiver slots (0x01..=0x06)
+            for dev_idx in [0xFFu8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06] {
+                // Query IRoot (0x00) for Unified Battery (0x1004) then Battery Status (0x1000)
+                let (feat_idx, is_unified) = if let Some(r) = hidpp_transact(h, dev_idx, 0x00, 0x0A, &[0x10, 0x04]) {
+                    if r[4] != 0 { (r[4], true) } else { (0, false) }
+                } else {
+                    (0, false)
+                };
+
+                let (feat_idx, is_unified) = if feat_idx != 0 {
+                    (feat_idx, is_unified)
+                } else if let Some(r) = hidpp_transact(h, dev_idx, 0x00, 0x0A, &[0x10, 0x00]) {
+                    if r[4] != 0 { (r[4], false) } else { (0, false) }
+                } else {
+                    (0, false)
+                };
+
+                if feat_idx == 0 {
+                    continue;
+                }
+
+                // 0x1004 get_status is func 0x10; 0x1000 GetBatteryLevelStatus is func 0x00
+                let func_sw = if is_unified { 0x1A } else { 0x0A };
+                if let Some(resp) = hidpp_transact(h, dev_idx, feat_idx, func_sw, &[]) {
+                    let pct = resp[4].min(100);
+                    let status = resp[6];
+                    let charging = matches!(status, 1 | 2 | 4);
+                    let label = if dev_idx == 0xFF || dev_idx == 0x01 {
+                        base_name.clone()
+                    } else {
+                        format!("{} #{}", base_name, dev_idx)
+                    };
+                    found.push(HidWirelessDeviceStatus {
+                        device: label,
+                        connected: true,
+                        battery: Some(pct),
+                        charging,
+                        connection_type: "2.4GHz LIGHTSPEED".to_string(),
+                    });
+                    if dev_idx == 0xFF {
+                        break;
+                    }
+                }
+            }
+
+            CloseHandle(h);
+        }
+    }
+
+    found
+}
+
+// -----------------------------------------------------------------------------
+// Razer Wireless 90-byte Feature Report Protocol (VID 0x1532)
+// Command Class 0x07, Command 0x80 (Battery) & 0x84 (Charging), XOR checksum
+// -----------------------------------------------------------------------------
+
+unsafe fn razer_feature_query(
+    h: *mut c_void,
+    report_len: usize,
+    has_report_id: bool,
+    tx_id: u8,
+    cmd_id: u8,
+) -> Option<[u8; 90]> {
+    let offset = if has_report_id { 1 } else { 0 };
+    let mut buf = vec![0u8; report_len];
+    let pkt = &mut buf[offset..offset + 90];
+    pkt[1] = tx_id;
+    pkt[2] = 0x02;
+    pkt[5] = 0x07; // Battery class
+    pkt[6] = cmd_id;
+
+    let mut xor_sum = 0u8;
+    for b in &pkt[2..88] {
+        xor_sum ^= *b;
+    }
+    pkt[88] = xor_sum;
+
+    unsafe {
+        if HidD_SetFeature(h, buf.as_ptr(), report_len as DWORD) == 0 {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(35));
+
+        let mut resp = vec![0u8; report_len];
+        if HidD_GetFeature(h, resp.as_mut_ptr(), report_len as DWORD) == 0 {
+            return None;
+        }
+
+        let mut out = [0u8; 90];
+        out.copy_from_slice(&resp[offset..offset + 90]);
+        if out[0] == 0x02 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn read_razer_devices(devices: &[HidInterfaceInfo]) -> Vec<HidWirelessDeviceStatus> {
+    let mut found = Vec::new();
+    let mut seen_pids = std::collections::HashSet::new();
+
+    for d in devices
+        .iter()
+        .filter(|d| d.vid == 0x1532 && (d.feat_len == 91 || d.feat_len == 90))
+    {
+        if !seen_pids.insert(d.pid) {
+            continue;
+        }
+        unsafe {
+            let wide_path = to_wide_null(&d.path);
+            let h = CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            );
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+
+            let has_rid = d.feat_len == 91;
+            let len = d.feat_len as usize;
+            let name = if d.product_name.is_empty() {
+                format!("Razer Wireless ({:04X})", d.pid)
+            } else {
+                d.product_name.clone()
+            };
+
+            let mut battery = None;
+            let mut charging = false;
+            for tx in [0x1Fu8, 0x3Fu8] {
+                if let Some(pkt) = razer_feature_query(h, len, has_rid, tx, 0x80) {
+                    let pct = ((pkt[9] as u16 * 100) / 255).min(100) as u8;
+                    battery = Some(pct);
+                    if let Some(chg_pkt) = razer_feature_query(h, len, has_rid, tx, 0x84) {
+                        charging = chg_pkt[9] == 0x01;
+                    }
+                    break;
+                }
+            }
+
+            if battery.is_some() {
+                found.push(HidWirelessDeviceStatus {
+                    device: name,
+                    connected: true,
+                    battery,
+                    charging,
+                    connection_type: "2.4GHz HyperSpeed".to_string(),
+                });
+            }
+
+            CloseHandle(h);
+        }
+    }
+
+    found
+}
+
 pub fn get_all_devices() -> AllDevicesStatus {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -634,11 +908,15 @@ pub fn get_all_devices() -> AllDevicesStatus {
     let incott = read_incott_mouse(&hid_devices);
     let (keychron, others) = read_keychron_and_bluetooth();
 
+    let mut extra_hid_devices = read_logitech_hidpp_devices(&hid_devices);
+    extra_hid_devices.extend(read_razer_devices(&hid_devices));
+
     AllDevicesStatus {
         timestamp: now,
         hyperx,
         incott,
         keychron,
+        extra_hid_devices,
         other_devices: others,
     }
 }
