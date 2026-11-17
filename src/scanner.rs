@@ -272,7 +272,7 @@ pub fn read_hyperx_cloud_3(devices: &[HidInterfaceInfo]) -> HyperXStatus {
             if read_bytes >= 9 && in_buf[0] == 0x0C {
                 let bat = in_buf[6];
                 let mv = ((in_buf[7] as u16) << 8) | (in_buf[8] as u16);
-                if mv == 0 && bat == 0 {
+                if (mv == 0 && bat == 0) || bat > 100 {
                     status = "Headset asleep / off".to_string();
                 } else {
                     battery = Some(bat);
@@ -359,44 +359,21 @@ pub fn read_incott_mouse(devices: &[HidInterfaceInfo]) -> IncottStatus {
 
         let mut battery: Option<u8> = None;
         let mut charging = is_wired;
-        let mut dpi: Option<u32> = None;
-        let mut polling_rate: Option<u32> = None;
-
-        let dpi_table = [400, 800, 1600, 2400, 3200, 6400];
-        let hz_table = [(0, 1000), (1, 500), (2, 250), (3, 125), (4, 8000), (5, 4000), (6, 2000)];
+        // DPI / polling rate are not reliably encoded in the 0x89 status reply, so don't guess.
+        let dpi: Option<u32> = None;
+        let polling_rate: Option<u32> = None;
 
         for _ in 0..12 {
             std::thread::sleep(std::time::Duration::from_millis(40));
             let mut resp = [0u8; 9];
             resp[0] = 0x09;
             if HidD_GetFeature(h, resp.as_mut_ptr(), 9) != 0 {
-                // byte 1 is command echo (0x89), byte 8 is actual battery percentage
-                if resp[1] == 0x89 && resp[8] > 0 {
-                    let raw_bat = resp[8];
-                    let (bat, chg) = if raw_bat > 100 {
-                        (raw_bat - 128, true)
-                    } else {
-                        (raw_bat, is_wired)
-                    };
+                // Reply layout: [0]=0x09 report id, [1]=0x89 echo, [2]=battery % (bit 7 = charging)
+                if resp[1] == 0x89 && (resp[2] != 0 || resp[3] != 0) {
+                    let raw_bat = resp[2];
+                    let bat = if raw_bat > 100 { raw_bat & 0x7F } else { raw_bat }.min(100);
                     battery = Some(bat);
-                    charging = chg;
-
-                    let hz_idx = (resp[2] & 0x0F) as u32;
-                    let dpi_idx = ((resp[2] & 0xF0) >> 4) as usize;
-
-                    dpi = Some(if dpi_idx < dpi_table.len() {
-                        dpi_table[dpi_idx]
-                    } else {
-                        800
-                    });
-
-                    polling_rate = Some(
-                        hz_table
-                            .iter()
-                            .find(|(k, _)| *k == hz_idx)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(1000),
-                    );
+                    charging = is_wired || raw_bat > 100;
                     break;
                 }
             }
